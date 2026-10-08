@@ -5,7 +5,7 @@ Compilation and execution take place in a Web Worker. No compilation server is n
 
 This repository contains the static site and generated compiler assets deployed by GitHub Pages.
 The playground implementation lives in
-[vlang/v](https://github.com/vlang/v/tree/e6634b0d45a25d65683de87337858347337759cb/examples/wasm/playground).
+[vlang/v](https://github.com/vlang/v/tree/e6634b0d45/examples/wasm/playground).
 
 ## Supported programs
 
@@ -30,6 +30,8 @@ at that commit to regenerate the compiler assets.
 Copy `index.html`, `playground.js`, `worker.js`, `runtime.mjs`, and the generated
 `build/compiler.mjs`, `build/compiler.wasm`, and `build/compiler.data` into this repository.
 Update `build-info.json`, retain `.nojekyll`, and push to `main`.
-GitHub Pages publishes the root of `main` at the address above.
+The `Deploy playground` workflow publishes the static site to GitHub Pages.
+It uses a GitHub-hosted runner by default. Manual deployments can specify a different
+runner label when a temporary deployment runner is available.
 
 Before publishing, run the upstream Node runtime tests and check the page in a browser.

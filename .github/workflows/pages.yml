@@ -1,0 +1,51 @@
+name: Deploy playground
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label for this deployment
+        default: ubuntu-latest
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out site
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          path: site
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          rsync -a --exclude='.git' --exclude='.github' site/ _site/
+      - uses: actions/configure-pages@v6
+      - name: Archive Pages artifact
+        run: |
+          chmod -R a+rX _site
+          tar -C _site -cf "$RUNNER_TEMP/artifact.tar" .
+      - name: Upload Pages artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: github-pages
+          path: ${{ runner.temp }}/artifact.tar
+          retention-days: 1
+          if-no-files-found: error
+      - id: deployment
+        uses: actions/deploy-pages@v5
