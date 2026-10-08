@@ -1,0 +1,39 @@
+{
+  "v_source_repository": "https://github.com/vlang/v",
+  "v_source_commit": "e6634b0d45a25d65683de87337858347337759cb",
+  "emsdk_commit": "b44154299bdefe75ba287874bb63fc9806243771",
+  "emscripten_version": "6.0.11",
+  "built_at": "2026-10-08T10:04:12.807888+00:00",
+  "build_command": "sh examples/wasm/playground/build.sh",
+  "native_builder_command": "./v -gc none -no-parallel -no-prealloc -compile-backend wasm -cc clang -o ./v-playground-builder vlib/v/v.v",
+  "assets": {
+    "index.html": {
+      "sha256": "3207c125dd1e12faa94a4b63bbad3c5e7ca5cc8b2be3064ec6ce04ad5428368f",
+      "bytes": 3576
+    },
+    "playground.js": {
+      "sha256": "657f388d3f38b4bd166e2ff9c6ee06b09e5d2c84429a76a843690cba9c109591",
+      "bytes": 2723
+    },
+    "worker.js": {
+      "sha256": "6c3abde2b5e6c0fb19a0bac5ff66bd095024adc8a022f1ef1e39e86fe00a200e",
+      "bytes": 2375
+    },
+    "runtime.mjs": {
+      "sha256": "83c3087f77a3d4d343890926151cc5ad0ba79e5eb1c2cf2468a193308c2f3b54",
+      "bytes": 1840
+    },
+    "build/compiler.mjs": {
+      "sha256": "c17c7784e6259bba87c556b9c1703d005a5318a9a202f4e589bf951d647778eb",
+      "bytes": 179056
+    },
+    "build/compiler.wasm": {
+      "sha256": "a24c78a845dda54ef7bafd91f6df27f97ee9c8201d4733f12ffcf6fd28f98159",
+      "bytes": 19656651
+    },
+    "build/compiler.data": {
+      "sha256": "4caa507b50f9b67ba3e8a03b484cf6bd2e3bcf0dac1d10547e87d58d7450cf32",
+      "bytes": 1140480
+    }
+  }
+}
