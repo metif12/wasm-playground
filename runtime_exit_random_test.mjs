@@ -74,11 +74,29 @@ function iovec(ptr, len) {
 // reached because the import throws, which is what makes proc_exit a
 // non-returning call the way a real module uses it.
 function exitModule(code) {
-	const types = section(1, [...leb(2), 0x60, ...leb(1), 0x7f, 0x00, 0x60, 0x00, 0x00]);
-	const imports = section(2, [...leb(1), ...wstr('wasi_snapshot_preview1'), ...wstr('proc_exit'), 0x00, ...leb(0)]);
+	const types = section(1, [
+		...leb(2),
+		0x60, ...leb(1), 0x7f, 0x00,
+		0x60, 0x00, 0x00,
+	]);
+	const imports = section(2, [
+		...leb(1),
+		...wstr('wasi_snapshot_preview1'),
+		...wstr('proc_exit'),
+		0x00,
+		...leb(0),
+	]);
 	const funcs = section(3, [...leb(1), ...leb(1)]);
 	const mem = section(5, [...leb(1), 0x00, ...leb(1)]);
-	const exports = section(7, [...leb(2), ...wstr('memory'), 0x02, ...leb(0), ...wstr('_start'), 0x00, ...leb(1)]);
+	const exports = section(7, [
+		...leb(2),
+		...wstr('memory'),
+		0x02,
+		...leb(0),
+		...wstr('_start'),
+		0x00,
+		...leb(1),
+	]);
 	const bodyBytes = [0x00, 0x41, ...sleb(code), 0x10, 0x00, 0x0b];
 	const codeSec = section(10, [...leb(1), ...leb(bodyBytes.length), ...bodyBytes]);
 	return new Uint8Array([...HEADER, ...types, ...imports, ...funcs, ...mem, ...exports, ...codeSec]);
@@ -94,7 +112,8 @@ function randomModule(ptr, len, { pages = 32, raw = false } = {}) {
 	const types = section(1, [
 		...leb(3),
 		0x60, ...leb(2), 0x7f, 0x7f, ...leb(1), 0x7f, // random_get -> errno
-		0x60, ...leb(4), 0x7f, 0x7f, 0x7f, 0x7f, ...leb(1), 0x7f, // fd_write -> errno
+		0x60, ...leb(4), 0x7f, 0x7f, 0x7f, 0x7f, ...leb(1), 0x7f,
+		// fd_write -> errno
 		0x60, 0x00, 0x00, // _start
 	]);
 	const imports = section(2, [
@@ -104,14 +123,24 @@ function randomModule(ptr, len, { pages = 32, raw = false } = {}) {
 	]);
 	const funcs = section(3, [...leb(1), ...leb(2)]);
 	const mem = section(5, [...leb(1), 0x00, ...leb(pages)]);
-	const exports = section(7, [...leb(2), ...wstr('memory'), 0x02, ...leb(0), ...wstr('_start'), 0x00, ...leb(2)]);
+	const exports = section(7, [
+		...leb(2),
+		...wstr('memory'),
+		0x02,
+		...leb(0),
+		...wstr('_start'),
+		0x00,
+		...leb(2),
+	]);
 	const report = 2048;
 	const body = raw
-		? [0x00, 0x41, ...sleb(ptr), 0x41, ...sleb(len), ...callDrop(0), ...iovec(ptr, len), 0x0b]
+		? [0x00, 0x41, ...sleb(ptr), 0x41, ...sleb(len),
+			...callDrop(0), ...iovec(ptr, len), 0x0b]
 		: [
 			0x01, 0x01, 0x7f, // one local: i32
 			0x41, ...sleb(ptr), 0x41, ...sleb(len), ...call(0), 0x21, 0x00, // r = random_get(...)
-			0x41, ...sleb(report), 0x41, ...sleb(48), 0x20, 0x00, 0x45, 0x6a, 0x3a, 0x00, 0x00, // '0'+ (r==0)
+			0x41, ...sleb(report), 0x41, ...sleb(48), 0x20, 0x00, 0x45, 0x6a, 0x3a, 0x00, 0x00,
+			// '0' + (r == 0)
 			...iovec(report, 1),
 			0x0b,
 		];
