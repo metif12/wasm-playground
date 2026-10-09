@@ -36,6 +36,26 @@ the shipped worker with a stubbed fmt build:
 
     node --test worker_format_test.mjs
 
+## WASI surface
+
+`runtime.mjs` provides the WASI imports the backend emits. Beyond `fd_write`,
+for stdout and stderr:
+
+- `proc_exit`, which the backend emits whenever `panic` or `exit` is reachable.
+  Without it a module that panics cannot be linked at all, so the visitor sees
+  a link error instead of the panic message. The import throws a `WasiExit`
+  that `runWasm` catches; exit code 0 is a success and any other code is
+  reported as an error. The host implementation may be used by other hosts, so
+  the thrown type is exported rather than kept internal.
+- `random_get`, filled from `crypto.getRandomValues`. The WASI spec caps a
+  single call, so larger requests are served as several fills.
+
+Each fixture in `runtime_exit_random_test.mjs` is a hand-built module that
+imports only the calls under test, so a module importing something the runtime
+lacks fails at instantiation rather than in the body under test:
+
+    node --test runtime_exit_random_test.mjs
+
 ## Rebuild and publish
 
 The deployed V source commit is `e6634b0d45a25d65683de87337858347337759cb` (PR #29741).
