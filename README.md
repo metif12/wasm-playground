@@ -18,6 +18,24 @@ arrays, maps, structs, and general standard library programs are not yet support
 
 The first run downloads the compiler assets. Later runs can reuse the browser's HTTP cache.
 
+## Formatting
+
+The Format button formats the editor source without leaving the browser. The
+worker sends `{type:'format', source}` and reports back `{type:'formatted',
+body}` or `{type:'error', message}`, using a fmt tool build
+(`build/fmt.mjs`) beside the compiler build. The tool formats via
+`v.format_text`, which needs no subprocess, unlike the `v fmt` driver.
+
+`build/fmt.mjs` is not deployed yet: until it is, Format reports that the
+formatter assets are missing instead of hanging. Regenerate it with the fmt
+tool build and copy it next to the compiler assets, then update
+`build-info.json`.
+
+The format protocol is pinned by `worker_format_test.mjs`, which runs against
+the shipped worker with a stubbed fmt build:
+
+    node --test worker_format_test.mjs
+
 ## Rebuild and publish
 
 The deployed V source commit is `e6634b0d45a25d65683de87337858347337759cb` (PR #29741).
