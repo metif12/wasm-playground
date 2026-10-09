@@ -18,6 +18,11 @@
 //   - Linear address 0 is writable. The backend stores its fd_write byte count
 //     there, so a NULL-pointer guard would break V-generated modules.
 //   - Validate everything before performing any visible side effect.
+//
+// The descriptor layout follows the WASI convention: 0-2 are the console, 3 is
+// the single preopened directory, and path_open hands out 4 and above. Those
+// descriptors are backed by an in-memory store built per runWasm call, so what
+// one program writes is invisible to the next.
 
 export class WasiExit extends Error {
 	constructor(code) {
@@ -31,6 +36,8 @@ export class WasiExit extends Error {
 const EBADF = 8;
 const EFAULT = 21;
 const EINVAL = 28;
+const ENOENT = 44;
+const EPERM = 63;
 
 // random_get fills at most this many bytes per call; the WASI spec caps a
 // single call, so larger requests are served as several fill calls.
@@ -44,6 +51,33 @@ const default_argv = ['main.wasm'];
 // ids describe a thread this runtime does not model.
 const CLOCK_REALTIME = 0;
 const CLOCK_MONOTONIC = 1;
+
+// 0-2 are the console, 3 is the preopened root, and every file descriptor the
+// runtime hands out is 4 or above.
+const STDERR_FD = 2;
+const PREOPEN_FD = 3;
+const FIRST_FILE_FD = 4;
+const PREOPEN_NAME = '/';
+
+// __WASI_PREOPENTYPE_DIR, the only prestat kind there is here. The struct is
+// the tag byte padded out to the u32 that follows it, so the tag goes at +0 and
+// the name length at +4.
+const PRESTAT_SIZE = 8;
+const PRESTAT_TAG_DIR = 0;
+
+// __WASI_FILETYPE_*: the byte that lets a guest tell a console descriptor from
+// a stored file.
+const FILETYPE_CHAR_DEVICE = 2;
+const FILETYPE_DIRECTORY = 3;
+const FILETYPE_REGULAR_FILE = 4;
+
+// __WASI_OFLAGS_* and __WASI_FDFLAGS_*, the two flag words of path_open.
+const OFLAG_CREAT = 1;
+const OFLAG_TRUNC = 8;
+const FDFLAG_APPEND = 1;
+
+// fdstat is filetype, fdflags, then the two i64 rights fields.
+const FDSTAT_SIZE = 24;
 
 // guest exposes the guest's linear memory for one import call.
 function guest(instance) {
@@ -79,6 +113,49 @@ function writeU32(g, ptr, value) {
 	g.view.setUint32(ptr >>> 0, value >>> 0, true);
 }
 
+// iovecBytes validates the iovec array and returns the byte ranges it names.
+// A write to the console and a write to a stored file share this, so both
+// refuse a bad iovec before either touches the guest.
+function iovecBytes(g, iovs, count) {
+	const iovecs = readIovecs(g, iovs, count);
+	if (iovecs === null) return null;
+	return {
+		total: iovecs.reduce((n, io) => n + io.len, 0),
+		parts: iovecs.map((io) => new Uint8Array(g.view.buffer, io.buf, io.len)),
+	};
+}
+
+// guestPath maps a guest path onto a key of the backing store, or returns the
+// errno that explains why it cannot. The store is flat, so a path that names a
+// parent directory or an absolute location is refused instead of resolved: a
+// playground has no directory tree to walk out of.
+function guestPath(g, path_ptr, path_len) {
+	if (!g.inBounds(path_ptr, path_len)) return { errno: EFAULT };
+	const raw = new TextDecoder().decode(new Uint8Array(g.view.buffer, path_ptr, path_len));
+	const path = raw.startsWith('./') ? raw.slice(2) : raw;
+	if (path === '') return { errno: EINVAL };
+	if (path.startsWith('/') || path.split('/').includes('..')) return { errno: EPERM };
+	return { path };
+}
+
+// storeAppend concatenates `parts` onto the file's bytes and returns the new
+// length. A new array is built each time rather than appended in place, because
+// the store owns its bytes: aliasing the guest's memory would leave a file
+// reading a detached buffer once the guest grows that memory.
+function storeAppend(files, path, parts) {
+	const before = files.get(path);
+	const size = parts.reduce((n, p) => n + p.length, 0);
+	const grown = new Uint8Array(before.length + size);
+	grown.set(before, 0);
+	let at = before.length;
+	for (const part of parts) {
+		grown.set(part, at);
+		at += part.length;
+	}
+	files.set(path, grown);
+	return grown.length;
+}
+
 export async function runWasm(bytes, onOutput, options = {}) {
 	const argv = options.argv ?? default_argv;
 	const stdin = options.stdin ?? [];
@@ -87,32 +164,37 @@ export async function runWasm(bytes, onOutput, options = {}) {
 	let instance;
 	let outputBytes = 0;
 	let stdinPos = 0;
+	const files = new Map();
+	const openFiles = new Map();
+	let nextFileFd = FIRST_FILE_FD;
 	const imports = {
 		wasi_snapshot_preview1: {
 			fd_write(fd, iovs, count, written) {
-				if (!decoders.has(fd)) return EBADF;
+				const file = openFiles.get(fd);
+				if (file === undefined && !decoders.has(fd)) return EBADF;
 				const g = guest(instance);
 				iovs >>>= 0;
 				count >>>= 0;
 				written >>>= 0;
 				if (!g.inBounds(written, 4)) return EFAULT;
-				const iovecs = readIovecs(g, iovs, count);
-				if (iovecs === null) return EFAULT;
-				const chunks = [];
-				let total = 0;
-				for (const io of iovecs) {
-					total += io.len;
-					chunks.push(new Uint8Array(g.view.buffer, io.buf, io.len));
+				const data = iovecBytes(g, iovs, count);
+				if (data === null) return EFAULT;
+				if (file !== undefined) {
+					storeAppend(files, file.path, data.parts);
+					writeU32(g, written, data.total);
+					return 0;
 				}
-				outputBytes += total;
+				// Only the console is metered: the cap exists to stop a program
+				// from drowning the page, and a file write is invisible there.
+				outputBytes += data.total;
 				if (outputBytes > 1024 * 1024) {
 					throw new Error('Output exceeded 1 MiB. Stop or shorten the program.');
 				}
-				for (const chunk of chunks) {
-					const text = decoders.get(fd).decode(chunk, { stream: true });
+				for (const part of data.parts) {
+					const text = decoders.get(fd).decode(part, { stream: true });
 					if (text) onOutput(text);
 				}
-				writeU32(g, written, total);
+				writeU32(g, written, data.total);
 				return 0;
 			},
 			// Without this the module cannot be linked at all when a panic or
@@ -172,12 +254,14 @@ export async function runWasm(bytes, onOutput, options = {}) {
 				writeU32(g, argv_ptr + encoded.length * 4, 0);
 				return 0;
 			},
-			// Stdin only; the guest reads the buffered input and then sees EOF.
-			// The stream has to be drained from memory before _start runs,
+			// Stdin only, unless path_open has handed out a descriptor. The
+			// stdin stream has to be drained from memory before _start runs,
 			// because _start is one synchronous call and cannot wait for a
-			// postMessage.
+			// postMessage. The two sources differ only in where their bytes live
+			// and which counter they advance, so they share one copy loop.
 			fd_read(fd, iovs, iovs_len, nread) {
-				if (fd !== 0) return EBADF;
+				const file = openFiles.get(fd);
+				if (fd !== 0 && file === undefined) return EBADF;
 				const g = guest(instance);
 				iovs >>>= 0;
 				iovs_len >>>= 0;
@@ -185,17 +269,97 @@ export async function runWasm(bytes, onOutput, options = {}) {
 				if (!g.inBounds(nread, 4)) return EFAULT;
 				const iovecs = readIovecs(g, iovs, iovs_len);
 				if (iovecs === null) return EFAULT;
+				const src = file === undefined ? stdin : files.get(file.path);
+				let pos = file === undefined ? stdinPos : file.pos;
 				let read = 0;
 				for (const io of iovecs) {
-					const can = Math.min(io.len, stdin.length - stdinPos);
+					const can = Math.min(io.len, src.length - pos);
 					if (can > 0) {
-						new Uint8Array(g.view.buffer, io.buf, can).set(stdin.subarray(stdinPos, stdinPos + can));
-						stdinPos += can;
+						new Uint8Array(g.view.buffer, io.buf, can).set(src.subarray(pos, pos + can));
+						pos += can;
 						read += can;
 					}
-					if (stdinPos >= stdin.length) break;
+					if (pos >= src.length) break;
 				}
+				if (file === undefined) stdinPos = pos;
+				else file.pos = pos;
 				writeU32(g, nread, read);
+				return 0;
+			},
+			// The preopen is what lets a guest discover the root at all: without
+			// it wasilibc cannot resolve a single relative path.
+			fd_prestat_get(fd, prestat_ptr) {
+				if (fd !== PREOPEN_FD) return EBADF;
+				const g = guest(instance);
+				prestat_ptr >>>= 0;
+				if (!g.inBounds(prestat_ptr, PRESTAT_SIZE)) return EFAULT;
+				g.view.setUint8(prestat_ptr, PRESTAT_TAG_DIR);
+				g.view.setUint32(prestat_ptr + 4, PREOPEN_NAME.length, true);
+				return 0;
+			},
+			fd_prestat_dir_name(fd, path_ptr, path_len) {
+				if (fd !== PREOPEN_FD) return EBADF;
+				const g = guest(instance);
+				path_ptr >>>= 0;
+				path_len >>>= 0;
+				if (!g.inBounds(path_ptr, path_len)) return EFAULT;
+				const name = new TextEncoder().encode(PREOPEN_NAME);
+				if (path_len !== name.length) return EINVAL;
+				new Uint8Array(g.view.buffer, path_ptr, path_len).set(name);
+				return 0;
+			},
+			// dirflags are ignored: the store has no subdirectories, so there is
+			// one directory to look in. The rights fields arrive as BigInt
+			// because the ABI declares them i64, and are advisory here.
+			path_open(dirfd, dirflags, path_ptr, path_len, oflags, fs_rights_base,
+			fs_rights_inheriting, fdflags, opened_fd_ptr) {
+				if (dirfd !== PREOPEN_FD) return EBADF;
+				const g = guest(instance);
+				path_ptr >>>= 0;
+				path_len >>>= 0;
+				opened_fd_ptr >>>= 0;
+				if (!g.inBounds(opened_fd_ptr, 4)) return EFAULT;
+				const opened = guestPath(g, path_ptr, path_len);
+				if (opened.errno !== undefined) return opened.errno;
+				const create = (oflags & OFLAG_CREAT) !== 0;
+				if (!create && !files.has(opened.path)) return ENOENT;
+				if (create || (oflags & OFLAG_TRUNC) !== 0) {
+					files.set(opened.path, new Uint8Array(0));
+				}
+				const fd = nextFileFd++;
+				openFiles.set(fd, {
+					path: opened.path,
+					pos: (fdflags & FDFLAG_APPEND) !== 0 ? files.get(opened.path).length : 0,
+				});
+				writeU32(g, opened_fd_ptr, fd);
+				return 0;
+			},
+			fd_close(fd) {
+				fd >>>= 0;
+				// The console and the preopen are handed to the guest at startup,
+				// so closing one is a no-op rather than an error.
+				if (fd <= PREOPEN_FD) return 0;
+				if (!openFiles.delete(fd)) return EBADF;
+				return 0;
+			},
+			fd_fdstat_get(fd, stat_ptr) {
+				const g = guest(instance);
+				stat_ptr >>>= 0;
+				if (!g.inBounds(stat_ptr, FDSTAT_SIZE)) return EFAULT;
+				if (fd <= STDERR_FD) {
+					g.view.setUint8(stat_ptr, FILETYPE_CHAR_DEVICE);
+				} else if (fd === PREOPEN_FD) {
+					g.view.setUint8(stat_ptr, FILETYPE_DIRECTORY);
+				} else if (openFiles.has(fd)) {
+					g.view.setUint8(stat_ptr, FILETYPE_REGULAR_FILE);
+				} else {
+					return EBADF;
+				}
+				// Rights stay zero: the store models append and read, and nothing
+				// it cannot honour.
+				g.view.setUint16(stat_ptr + 2, 0, true);
+				g.view.setBigUint64(stat_ptr + 8, 0n, true);
+				g.view.setBigUint64(stat_ptr + 16, 0n, true);
 				return 0;
 			},
 			clock_time_get(clock_id, precision, time_ptr) {
