@@ -46,6 +46,7 @@ const EISDIR = 31;
 const ENOENT = 44;
 const ENOTDIR = 54;
 const ENOTEMPTY = 55;
+const ENOTSUP = 58;
 const EPERM = 63;
 const ESPIPE = 68;
 
@@ -113,6 +114,68 @@ const FDFLAG_APPEND = 1;
 
 // fdstat is filetype, fdflags, then the two i64 rights fields.
 const FDSTAT_SIZE = 24;
+
+// __WASI_RIGHTS_* of the calls this runtime answers, reported so a guest may
+// believe what fd_fdstat_get says. They are also what names a clock: it is a
+// character device like the console, and carries neither read nor write,
+// because waiting on one is poll_oneoff's business.
+const RIGHTS_FD_READ = 1n << 1n;
+const RIGHTS_FD_WRITE = 1n << 6n;
+// A stored file: read and write, the seek/tell pair and setting its flags.
+const RIGHTS_FILE = RIGHTS_FD_READ | (1n << 2n) | (1n << 3n) | (1n << 5n) | RIGHTS_FD_WRITE;
+// The preopen: every path call that acts on the entries below it.
+const RIGHTS_PREOPEN = (1n << 9n) | (1n << 10n) | (1n << 13n) | (1n << 18n) | (1n << 25n)
+	| (1n << 26n);
+
+// __WASI_EVENTTYPE_*, the tag byte that says which half of a subscription's
+// union is in use. Only the clock kind is answered: an fd subscription waits on
+// a descriptor, and nothing here does. The two fd tags are still declared,
+// because the runtime has to recognise them to refuse them rather than misread
+// a garbage tag as a clock.
+const EVENTTYPE_CLOCK = 0;
+const EVENTTYPE_FD_READ = 1;
+const EVENTTYPE_FD_WRITE = 2;
+
+// __WASI_SUBCLOCKFLAGS_SUBSCRIPTION_CLOCK_ABSTIME. Clear, the timeout counts
+// from now; set, it is a timestamp on the clock the subscription names.
+const SUBCLOCK_ABSTIME = 1;
+
+// __wasi_subscription_t is 48 bytes: the userdata word, then the tag byte and
+// its padding, then the 32 byte subscription_clock. The offsets are the ones
+// wasi-libc's wasip1.h pins with its _Static_assert lines, which put the clock
+// id at +16, the timeout at +24, the precision at +32 and the subclock flags at
+// +40. The id is the only u32 in either struct, so the four bytes behind it are
+// padding a guest may never have written and are never read.
+const SUBSCRIPTION_SIZE = 48;
+const SUBSCRIPTION_USERDATA_AT = 0;
+const SUBSCRIPTION_TYPE_AT = 8;
+const SUBSCRIPTION_ID_AT = 16;
+const SUBSCRIPTION_TIMEOUT_AT = 24;
+const SUBSCRIPTION_PRECISION_AT = 32;
+const SUBSCRIPTION_FLAGS_AT = 40;
+
+// __wasi_event_t is 32 bytes: the userdata word, then the errno u16 and the
+// eventtype u8, then fd_readwrite. A clock reports its reading in nbytes, which
+// is a u64 because __wasi_filesize_t is one, so a nanosecond stamp keeps the
+// seconds field that an i32 port would truncate.
+const EVENT_SIZE = 32;
+const EVENT_USERDATA_AT = 0;
+const EVENT_ERROR_AT = 8;
+const EVENT_TYPE_AT = 10;
+const EVENT_FD_READWRITE_AT = 16;
+const EVENT_FLAGS_AT = 24;
+
+// A clock reaches a guest as a descriptor, because the ABI defines no clock
+// preopen type and opening a path is the only way a guest is handed a
+// descriptor here. Both names are therefore reserved: `clock` is not a
+// directory of the store, and what is under it is not an entry in it.
+const CLOCK_DIR = 'clock';
+const CLOCK_PATH_MONOTONIC = 'clock/monotonic';
+const CLOCK_PATH_REALTIME = 'clock/realtime';
+const clock_paths = new Map([
+	[CLOCK_PATH_MONOTONIC, CLOCK_MONOTONIC],
+	[CLOCK_PATH_REALTIME, CLOCK_REALTIME],
+]);
 
 // guest exposes the guest's linear memory for one import call.
 function guest(instance) {
@@ -211,23 +274,26 @@ function guestPath(g, path_ptr, path_len) {
 
 // storeParent returns the errno that stops `path` being reachable, or null when
 // it is. The root always exists, so only a path with a component before its
-// last one has a parent to check.
-function storeParent(store, path) {
+// last one has a parent to check. A `virtual` name is a directory the runtime
+// serves from somewhere other than the store, so it has no entry to find.
+function storeParent(store, path, virtual = null) {
 	const cut = path.lastIndexOf('/');
 	if (cut <= 0) return null;
-	const parent = store.get(path.slice(0, cut));
-	if (parent === undefined) return ENOENT;
-	if (parent.kind !== NODE_DIR) return ENOTDIR;
+	const parent = path.slice(0, cut);
+	if (parent === virtual) return null;
+	const node = store.get(parent);
+	if (node === undefined) return ENOENT;
+	if (node.kind !== NODE_DIR) return ENOTDIR;
 	return null;
 }
 
 // storePath is the entry point every path_* call goes through: guestPath
 // refuses traversal and absolute paths, storeParent refuses a leading component
 // that is missing or is not a directory.
-function storePath(g, path_ptr, path_len, store) {
+function storePath(g, path_ptr, path_len, store, virtual = null) {
 	const opened = guestPath(g, path_ptr, path_len);
 	if (opened.errno !== undefined) return opened;
-	const errno = storeParent(store, opened.path);
+	const errno = storeParent(store, opened.path, virtual);
 	if (errno !== null) return { errno };
 	return opened;
 }
@@ -281,6 +347,48 @@ function writeFilestat(g, ptr, node) {
 	g.view.setBigUint64(ptr + FILESTAT_CTIM_AT, stamp, true);
 }
 
+// nowNs is the wall clock in nanoseconds. The millisecond reading is widened to
+// a BigInt before the multiply, because a whole nanosecond stamp is past 2^53
+// and a float multiply would round it to the nearest 256.
+function nowNs() {
+	return BigInt(Date.now()) * 1000000n;
+}
+
+// virtualTime reads the host monotonic counter. The guest's own monotonic clock
+// is seeded from it and is held in `virtualNow`, which is what a caller reads:
+// the two never disagree about which clock it is looking at.
+function virtualTime() {
+	return BigInt(Math.round(performance.timeOrigin * 1e6 + performance.now() * 1e6));
+}
+
+// readSubscription pulls one __wasi_subscription_t apart. The precision is left
+// alone, at SUBSCRIPTION_PRECISION_AT: it is how long a host may coalesce the
+// wait with another event, which a runtime that does not sleep has no use for.
+function readSubscription(g, at) {
+	return {
+		userdata: g.view.getBigUint64(at + SUBSCRIPTION_USERDATA_AT, true),
+		type: g.view.getUint8(at + SUBSCRIPTION_TYPE_AT),
+		clock: g.view.getUint32(at + SUBSCRIPTION_ID_AT, true),
+		timeout: g.view.getBigUint64(at + SUBSCRIPTION_TIMEOUT_AT, true),
+		flags: g.view.getUint16(at + SUBSCRIPTION_FLAGS_AT, true),
+	};
+}
+
+// writeEvent fills one __wasi_event_t with the answer to one subscription: the
+// userdata comes back, the errno is zero because a clock always resolves, and
+// nbytes carries the clock reading. The ABI says a clock event ignores
+// fd_readwrite, but a reading is the only answer that carries information back,
+// so it goes where the guest can find it.
+function writeEvent(g, ptr, event) {
+	g.view.setBigUint64(ptr + EVENT_USERDATA_AT, event.userdata, true);
+	g.view.setUint16(ptr + EVENT_ERROR_AT, event.error, true);
+	g.view.setUint8(ptr + EVENT_TYPE_AT, event.type);
+	g.view.setBigUint64(ptr + EVENT_FD_READWRITE_AT, event.nbytes, true);
+	// Nothing here hangs up, so the eventrwflags word is zero rather than
+	// whatever the guest left in the buffer.
+	g.view.setUint16(ptr + EVENT_FLAGS_AT, 0, true);
+}
+
 export async function runWasm(bytes, onOutput, options = {}) {
 	const argv = options.argv ?? default_argv;
 	const stdin = options.stdin ?? [];
@@ -291,6 +399,24 @@ export async function runWasm(bytes, onOutput, options = {}) {
 	let stdinPos = 0;
 	const store = new Map();
 	const openFiles = new Map();
+	// Clock descriptors, each mapping the descriptor it was given onto the clock
+	// id it names. They live apart from the store because they are not entries,
+	// and apart from openFiles because no file call may reach one.
+	const clocks = new Map();
+	// The guest's monotonic clock, which nothing but a poll_oneoff timeout
+	// advances. It is per run, like the store, so one program's wait is not
+	// visible to the next.
+	let virtualNow = virtualTime();
+	// advanceVirtual moves the monotonic clock to the moment a subscription's
+	// timeout asks for, and answers with the value now on it. An absolute
+	// timeout names that moment, so it is set as it stands; a relative one adds
+	// the duration. A clock already past the requested moment is not wound back,
+	// which is what keeps it monotonic for whoever reads it next.
+	const advanceVirtual = (timeout, abstime) => {
+		const want = abstime ? timeout : virtualNow + timeout;
+		virtualNow = want > virtualNow ? want : virtualNow;
+		return virtualNow;
+	};
 	let nextFileFd = FIRST_FILE_FD;
 	const imports = {
 		wasi_snapshot_preview1: {
@@ -492,8 +618,17 @@ export async function runWasm(bytes, onOutput, options = {}) {
 				path_len >>>= 0;
 				opened_fd_ptr >>>= 0;
 				if (!g.inBounds(opened_fd_ptr, 4)) return EFAULT;
-				const opened = storePath(g, path_ptr, path_len, store);
+				// The clock names are resolved before the store, since `clock`
+				// is a directory the store has never heard of.
+				const opened = storePath(g, path_ptr, path_len, store, CLOCK_DIR);
 				if (opened.errno !== undefined) return opened.errno;
+				const clock = clock_paths.get(opened.path);
+				if (clock !== undefined) {
+					const fd = nextFileFd++;
+					clocks.set(fd, clock);
+					writeU32(g, opened_fd_ptr, fd);
+					return 0;
+				}
 				const node = store.get(opened.path);
 				// The entry is emptied in place rather than replaced, so a
 				// descriptor already open on it keeps pointing at the same bytes
@@ -576,7 +711,7 @@ export async function runWasm(bytes, onOutput, options = {}) {
 				// The console and the preopen are handed to the guest at startup,
 				// so closing one is a no-op rather than an error.
 				if (fd <= PREOPEN_FD) return 0;
-				if (!openFiles.delete(fd)) return EBADF;
+				if (!openFiles.delete(fd) && !clocks.delete(fd)) return EBADF;
 				return 0;
 			},
 			fd_fdstat_get(fd, stat_ptr) {
@@ -585,25 +720,34 @@ export async function runWasm(bytes, onOutput, options = {}) {
 				stat_ptr >>>= 0;
 				if (!g.inBounds(stat_ptr, FDSTAT_SIZE)) return EFAULT;
 				const file = openFiles.get(fd);
-				// The flags the descriptor carries, so a guest that sets append
-				// can read back that it did. The console and the preopen have
-				// none to report.
-				const fdflags = file === undefined ? 0 : file.flags;
-				if (file === undefined) {
-					if (fd <= STDERR_FD) {
-						g.view.setUint8(stat_ptr, FILETYPE_CHAR_DEVICE);
-					} else if (fd === PREOPEN_FD) {
-						g.view.setUint8(stat_ptr, FILETYPE_DIRECTORY);
-					} else {
-						return EBADF;
-					}
+				// The filetype and the rights that go with it. Both are needed to
+				// name a clock: it is a character device like the console, and
+				// what separates the two is that it carries neither read nor
+				// write.
+				let filetype = FILETYPE_CHAR_DEVICE;
+				let rights = 0n;
+				if (clocks.has(fd)) {
+					filetype = FILETYPE_CHAR_DEVICE;
+				} else if (file !== undefined) {
+					filetype = FILETYPE_REGULAR_FILE;
+					rights = RIGHTS_FILE;
+				} else if (fd === 0) {
+					rights = RIGHTS_FD_READ;
+				} else if (fd <= STDERR_FD) {
+					rights = RIGHTS_FD_WRITE;
+				} else if (fd === PREOPEN_FD) {
+					filetype = FILETYPE_DIRECTORY;
+					rights = RIGHTS_PREOPEN;
 				} else {
-					g.view.setUint8(stat_ptr, FILETYPE_REGULAR_FILE);
+					return EBADF;
 				}
-				// Rights stay zero: the store models append and read, and
-				// nothing it cannot honour.
+				// The flags the descriptor carries, so a guest that set append
+				// can read back that it did. A clock and the preopen have none to
+				// report.
+				const fdflags = file === undefined ? 0 : file.flags;
+				g.view.setUint8(stat_ptr, filetype);
 				g.view.setUint16(stat_ptr + 2, fdflags, true);
-				g.view.setBigUint64(stat_ptr + 8, 0n, true);
+				g.view.setBigUint64(stat_ptr + 8, rights, true);
 				g.view.setBigUint64(stat_ptr + 16, 0n, true);
 				return 0;
 			},
@@ -632,16 +776,64 @@ export async function runWasm(bytes, onOutput, options = {}) {
 				time_ptr >>>= 0;
 				if (!g.inBounds(time_ptr, 8)) return EFAULT;
 				if (clock_id === CLOCK_REALTIME) {
-					const ns = BigInt(Math.round(Date.now() * 1e6));
-					g.view.setBigUint64(time_ptr, ns, true);
+					g.view.setBigUint64(time_ptr, nowNs(), true);
 					return 0;
 				}
 				if (clock_id === CLOCK_MONOTONIC) {
-					const ns = BigInt(Math.round(performance.timeOrigin * 1e6 + performance.now() * 1e6));
-					g.view.setBigUint64(time_ptr, ns, true);
+					g.view.setBigUint64(time_ptr, virtualNow, true);
 					return 0;
 				}
 				return EINVAL;
+			},
+			// The call a guest needs to wait at all, and the reason a V program
+			// can sleep in the playground. Every i64 inside the two structs is
+			// read and written as a BigInt, the same rule clock_time_get and
+			// fd_seek follow: a nanosecond stamp does not fit an i32, and mixing
+			// the two widths is how the seconds field silently truncates.
+			poll_oneoff(in_ptr, out_ptr, nsubscriptions, nevents_ptr) {
+				const g = guest(instance);
+				in_ptr >>>= 0;
+				out_ptr >>>= 0;
+				nsubscriptions >>>= 0;
+				nevents_ptr >>>= 0;
+				if (!g.inBounds(nevents_ptr, 4)) return EFAULT;
+				if (!g.inBounds(in_ptr, nsubscriptions * SUBSCRIPTION_SIZE)) return EFAULT;
+				if (!g.inBounds(out_ptr, nsubscriptions * EVENT_SIZE)) return EFAULT;
+				// A call about nothing would answer with a count it never came
+				// to, so it is refused rather than answered zero.
+				if (nsubscriptions === 0) return EINVAL;
+				const subs = [];
+				for (let i = 0; i < nsubscriptions; i++) {
+					const sub = readSubscription(g, in_ptr + i * SUBSCRIPTION_SIZE);
+					sub.index = i;
+					subs.push(sub);
+				}
+				// All the subscriptions are judged before any of them is
+				// answered, so an unsupported one leaves the out array as the
+				// guest filled it rather than half overwritten.
+				for (const sub of subs) {
+					if (sub.type !== EVENTTYPE_CLOCK) return ENOTSUP;
+					if (sub.clock !== CLOCK_REALTIME && sub.clock !== CLOCK_MONOTONIC) {
+						return ENOTSUP;
+					}
+				}
+				for (const sub of subs) {
+					// The monotonic clock is advanced by the wait rather than
+					// spent sleeping, so a test that waits costs nothing; the
+					// wall clock is read as it stands, because no runtime can
+					// move it and a guest compares it against real time.
+					const nbytes = sub.clock === CLOCK_MONOTONIC
+						? advanceVirtual(sub.timeout, (sub.flags & SUBCLOCK_ABSTIME) !== 0)
+						: nowNs();
+					writeEvent(g, out_ptr + sub.index * EVENT_SIZE, {
+						userdata: sub.userdata,
+						error: 0,
+						type: EVENTTYPE_CLOCK,
+						nbytes,
+					});
+				}
+				writeU32(g, nevents_ptr, nsubscriptions);
+				return 0;
 			},
 		},
 	};
